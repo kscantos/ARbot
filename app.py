@@ -8,15 +8,41 @@ import glob
 import json
 import time
 import random
+import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
 import numpy as np
 import httpx
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("arbot")
+logger.setLevel(logging.INFO)
+_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "app.log"),
+    maxBytes=5_000_000,
+    backupCount=5,
+)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s %(name)s: %(message)s"
+))
+logger.addHandler(_handler)
+logger.addHandler(logging.StreamHandler())
 
 # config
 LARK_APP_ID     = os.getenv("LARK_APP_ID", "")
 LARK_APP_SECRET = os.getenv("LARK_APP_SECRET", "")
 LARK_API_BASE   = "https://open.larksuite.com/open-apis"
 LARK_HOST       = "https://casinoplus.sg.larksuite.com"
+NOTIFY_CHAT_ID  = os.getenv("NOTIFY_CHAT_ID", "")
+WIKI_NODE_TOKENS = [t for t in os.getenv("WIKI_NODE_TOKENS", "").split(",") if t]
+DOCX_TOKENS      = [t for t in os.getenv("DOCX_TOKENS", "").split(",") if t]
 
 # model + alert store
 model           = SentenceTransformer("all-MiniLM-L6-v2")
@@ -218,56 +244,47 @@ async def lifespan(app: FastAPI):
         sources_loaded += 1
 
     # lark docs
-    lark_docs = {
-        "Test_OTGDocu": {
-            "token": os.getenv("LARK_DOC_TOKEN", "UBbtdRW12omxzxxy5Anl7WLtgv8"),
-            "type":  "docx",
-            "url":   f"{LARK_HOST}/docx/UBbtdRW12omxzxxy5Anl7WLtgv8",
-        },
-        "Test_CriticalAlerts": {
-            "token": "Sw7TwD9CpiSGrukQoUbl2R4zgac",
-            "type":  "wiki",
-            "url":   f"{LARK_HOST}/wiki/Sw7TwD9CpiSGrukQoUbl2R4zgac",
-        },
-        "Test_LiveslotErrors": {
-            "token": "Md1IwdngciTUW1k6H0flMVWWgSg",
-            "type":  "wiki",
-            "url":   f"{LARK_HOST}/wiki/Md1IwdngciTUW1k6H0flMVWWgSg",
-        },
-        "Test_LiveslotP0": {
-            "token": "WaYewzsMti2StxkUW36lU2aVg5b",
-            "type":  "wiki",
-            "url":   f"{LARK_HOST}/wiki/WaYewzsMti2StxkUW36lU2aVg5b",
-        },
-    }
-
     token = await get_lark_token()
-    for doc_name, cfg in lark_docs.items():
-        doc_token = cfg["token"]
-        if not doc_token:
-            continue
+
+    for node_token in WIKI_NODE_TOKENS:
         try:
-            if cfg["type"] == "wiki":
-                document_id = await fetch_wiki_obj_token(doc_token, token)
-                if not document_id:
-                    print(f"No obj_token for wiki node: {doc_name}")
-                    continue
-            else:
-                document_id = doc_token
+            document_id = await fetch_wiki_obj_token(node_token, token)
+            if not document_id:
+                logger.warning(f"No obj_token for wiki node: {node_token}")
+                continue
             blocks = await fetch_doc_blocks(document_id, token)
         except httpx.HTTPStatusError as e:
-            print(f"Failed to load {doc_name}: {e.response.status_code} {e.response.text}")
+            logger.error(f"Failed to load wiki node {node_token}: {e.response.status_code} {e.response.text}")
             continue
 
         secs = blocks_to_sections(blocks)
-        register_sections(doc_name, cfg["url"], secs)
+        register_sections(node_token, f"{LARK_HOST}/wiki/{node_token}", secs)
         sources_loaded += 1
-        print(f"Loaded {doc_name}: {len(secs)} alerts")
+        logger.info(f"Loaded wiki:{node_token}: {len(secs)} alerts")
+
+    for doc_token in DOCX_TOKENS:
+        try:
+            blocks = await fetch_doc_blocks(doc_token, token)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to load docx {doc_token}: {e.response.status_code} {e.response.text}")
+            continue
+
+        secs = blocks_to_sections(blocks)
+        register_sections(doc_token, f"{LARK_HOST}/docx/{doc_token}", secs)
+        sources_loaded += 1
+        logger.info(f"Loaded docx:{doc_token}: {len(secs)} alerts")
 
     # embeddings (over titles, normalized so scores are real cosine)
     if alert_titles:
         alert_embeddings = model.encode(alert_titles, normalize_embeddings=True)
-        print(f"Sources: {sources_loaded}  Alerts: {len(alerts)}")
+        logger.info(f"Sources: {sources_loaded}  Alerts: {len(alerts)}")
+
+    # notify a chat that the bot (re)started, if configured
+    if NOTIFY_CHAT_ID:
+        try:
+            await send_lark_message(NOTIFY_CHAT_ID, "bot started/restarted")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to send startup notification: {e.response.status_code} {e.response.text}")
 
     yield
 
@@ -462,7 +479,7 @@ async def _send(receive_id: str, msg_type: str, content: str, receive_id_type: s
         except Exception:
             pass
         if r.status_code != 200 or data.get("code", 0) != 0:
-            print(f"send failed ({msg_type}): {r.status_code} {r.text}")
+            logger.error(f"send failed ({msg_type}): {r.status_code} {r.text}")
         r.raise_for_status()
 
 
@@ -478,6 +495,40 @@ async def chat_endpoint(request: ChatRequest):
     return ChatResponse(query=request.text, results=search_alerts(request.text, request.top_k))
 
 
+# dedupe retried webhook deliveries (Lark retries if we don't ack fast enough)
+_seen_event_ids: set = set()
+
+
+async def _handle_message(raw: str, chat_id: str):
+    text = clean_text(raw)
+    receive_id, receive_id_type = chat_id, "chat_id"
+
+    logger.info(f"incoming text={text!r} chat_id={chat_id}")
+
+    low = text.lower()
+    if low == "/s" or low.startswith("/s "):
+        # search -> card
+        query = text[2:].strip()
+        if not query:
+            await send_lark_message(receive_id, "What should I search for? e.g. /s pod restart", receive_id_type)
+        elif not alerts:
+            await send_lark_message(receive_id, "No alerts loaded yet.", receive_id_type)
+        else:
+            results = search_alerts(query, top_k=5)
+            card    = build_search_card(query, results)
+            await send_lark_card(receive_id, card, receive_id_type)
+        return
+
+    # ping
+    if low == "ping":
+        ms = await measure_lark_ping()
+        await send_lark_message(receive_id, f"pong {ms:.0f}ms", receive_id_type)
+        return
+
+    # chat
+    await send_lark_message(receive_id, chat_reply(text), receive_id_type)
+
+
 # webhook
 @app.post("/lark/webhook")
 async def lark_webhook(request: Request):
@@ -486,6 +537,15 @@ async def lark_webhook(request: Request):
     # verification
     if "challenge" in body:
         return {"challenge": body["challenge"]}
+
+    # dedupe: Lark retries the same event_id if we don't ack in time
+    event_id = body.get("header", {}).get("event_id")
+    if event_id:
+        if event_id in _seen_event_ids:
+            return {"status": "duplicate"}
+        _seen_event_ids.add(event_id)
+        if len(_seen_event_ids) > 1000:
+            _seen_event_ids.clear()
 
     event = body.get("event", {})
     msg   = event.get("message", {})
@@ -499,36 +559,11 @@ async def lark_webhook(request: Request):
     except (KeyError, json.JSONDecodeError):
         return {"status": "bad_content"}
 
-    text = clean_text(raw)
-
     chat_id = msg.get("chat_id")
     if not chat_id:
         return {"status": "no_chat_id"}
-    receive_id, receive_id_type = chat_id, "chat_id"
 
-    print(f"incoming text={text!r} chat_id={chat_id} chat_type={msg.get('chat_type')}")
-
-    # response
-    low = text.lower()
-    if low == "/s" or low.startswith("/s "):
-        # search -> card
-        query = text[2:].strip()
-        if not query:
-            await send_lark_message(receive_id, "What should I search for? e.g. /s pod restart", receive_id_type)
-        elif not alerts:
-            await send_lark_message(receive_id, "No alerts loaded yet.", receive_id_type)
-        else:
-            results = search_alerts(query, top_k=5)
-            card    = build_search_card(query, results)
-            await send_lark_card(receive_id, card, receive_id_type)
-        return {"status": "ok"}
-
-    # ping
-    if low == "ping":
-        ms = await measure_lark_ping()
-        await send_lark_message(receive_id, f"pong {ms:.0f}ms", receive_id_type)
-        return {"status": "ok"}
-
-    # chat
-    await send_lark_message(receive_id, chat_reply(text), receive_id_type)
+    # ack immediately; process + reply in the background so Lark doesn't
+    # time out and redeliver the same event
+    asyncio.create_task(_handle_message(raw, chat_id))
     return {"status": "ok"}
