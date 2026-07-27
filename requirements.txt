@@ -4,4 +4,5 @@ pydantic
 sentence-transformers
 numpy
 lark-parser
-faiss-cpu  
+faiss-cpu
+python-dotenv  
